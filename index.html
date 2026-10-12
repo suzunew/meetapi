@@ -3,13 +3,16 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Google Meet風 ビデオ通話</title>
-  <!-- Tailwind CSS CDN -->
+  <title>P2P ビデオ・音声通話</title>
+  <!-- Tailwind CSS CDN (インラインビルド用) -->
   <script src="https://cdn.tailwindcss.com"></script>
   <!-- PeerJS -->
   <script src="https://unpkg.com/peerjs@1.5.2/dist/peerjs.min.js"></script>
   <style>
-    body { background-color: #202124; color: #e8eaed; font-family: 'Roboto', sans-serif; }
+    /* カスタム背景色が動的に変わるようにCSS変数を用意 */
+    :root { --bg-color: #202124; --panel-color: #292a2d; }
+    body { background-color: var(--bg-color); color: #e8eaed; font-family: 'Roboto', sans-serif; transition: background-color 0.3s; }
+    .dynamic-panel { background-color: var(--panel-color); }
     video { transform: scaleX(-1); object-fit: cover; }
     #remote-video { transform: scaleX(1); }
   </style>
@@ -20,37 +23,57 @@
   <header class="flex justify-between items-center px-6 py-4 bg-[#202124] border-b border-[#3c4043]">
     <div class="flex items-center space-x-3">
       <div class="w-8 h-8 bg-blue-500 rounded-lg flex items-center justify-center font-bold text-white">M</div>
-      <span class="text-lg font-medium">P2P ビデオ会議</span>
+      <span class="text-lg font-medium">P2P 通話アプリ</span>
     </div>
     <div class="flex items-center space-x-4 text-sm">
+      <!-- 背景色変更ピッカー -->
+      <div class="flex items-center space-x-2 bg-[#3c4043] px-3 py-1.5 rounded-lg">
+        <span class="text-xs text-gray-300">背景色:</span>
+        <input type="color" id="bg-color-picker" value="#202124" class="w-6 h-6 rounded cursor-pointer bg-transparent border-none" onchange="changeBgColor(this.value)">
+      </div>
       <div id="room-info" class="bg-[#3c4043] px-3 py-1.5 rounded-lg text-gray-300">
         ルームID: <span id="my-id" class="text-blue-400 font-bold">生成中...</span>
       </div>
       <button onclick="copyRoomLink()" class="bg-[#3c4043] hover:bg-[#4f5358] px-3 py-1.5 rounded-lg transition text-white flex items-center space-x-1.5">
-        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 5H6a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2v-1M8 5a2 2 0 002 2h2a2 2 0 002-2M8 5a2 2 0 012-2h2a2 2 0 012 2m0 0h2a2 2 0 012 2v3m2 4H10m0 0l3-3m-3 3l3 3"></path></svg>
         <span>リンクをコピー</span>
       </button>
     </div>
   </header>
 
-  <!-- メインコンテンツ（動画グリッド ＆ 接続モーダル） -->
+  <!-- メインコンテンツ -->
   <main class="flex-1 relative flex items-center justify-center p-4">
-    <!-- 接続前・待受画面（モーダル風オーバーレイ） -->
-    <div id="connect-screen" class="absolute z-20 bg-[#292a2d] p-8 rounded-2xl shadow-2xl border border-[#3c4043] max-w-md w-full text-center space-y-6">
-      <h2 class="text-xl font-semibold">通話を開始・参加する</h2>
-      <p class="text-sm text-gray-400">相手のルームIDを入力するか、このままリンクを共有してください。</p>
+    <!-- 接続前・待受画面（モード選択付き） -->
+    <div id="connect-screen" class="absolute z-20 dynamic-panel p-8 rounded-2xl shadow-2xl border border-[#3c4043] max-w-md w-full text-center space-y-6">
+      <h2 class="text-xl font-semibold">通話の開始・参加</h2>
+      
+      <!-- モード選択（ビデオ or 音声のみ） -->
+      <div class="flex justify-center space-x-4">
+        <label class="flex items-center space-x-2 cursor-pointer">
+          <input type="radio" name="call-mode" value="video" checked onchange="switchMode('video')" class="accent-blue-500">
+          <span class="text-sm">ビデオ通話</span>
+        </label>
+        <label class="flex items-center space-x-2 cursor-pointer">
+          <input type="radio" name="call-mode" value="audio" onchange="switchMode('audio')" class="accent-blue-500">
+          <span class="text-sm">音声通話のみ</span>
+        </label>
+      </div>
+
       <div class="flex space-x-2">
         <input type="text" id="partner-id" placeholder="相手のルームIDを入力" class="flex-1 bg-[#3c4043] border border-transparent focus:border-blue-500 rounded-lg px-4 py-2.5 text-white outline-none">
         <button onclick="connectToPartner()" class="bg-blue-600 hover:bg-blue-700 px-5 py-2.5 rounded-lg font-medium transition">接続する</button>
       </div>
-      <div id="status-text" class="text-xs text-yellow-400">カメラとマイクの準備中...</div>
+      <div id="status-text" class="text-xs text-yellow-400">デバイスを初期化中...</div>
     </div>
 
-    <!-- ビデオ表示エリア -->
-    <div class="grid grid-cols-1 md:grid-cols-2 gap-4 w-full h-full max-w-7xl max-h-[calc(100vh-140px)]">
-      <!-- 相手のビデオ -->
+    <!-- ビデオ/音声表示エリア -->
+    <div id="media-grid" class="grid grid-cols-1 md:grid-cols-2 gap-4 w-full h-full max-w-7xl max-h-[calc(100vh-140px)]">
+      <!-- 相手 -->
       <div class="relative bg-[#3c4043] rounded-2xl overflow-hidden flex items-center justify-center shadow-lg">
         <video id="remote-video" autoplay playsinline class="w-full h-full"></video>
+        <div id="remote-audio-indicator" class="hidden flex-col items-center justify-center space-y-3">
+          <div class="w-24 h-24 bg-blue-600 rounded-full flex items-center justify-center text-3xl font-bold animate-pulse">相手</div>
+          <span class="text-gray-300">音声通話中...</span>
+        </div>
         <div id="remote-placeholder" class="absolute text-gray-400 flex flex-col items-center">
           <div class="w-20 h-20 bg-[#5f6368] rounded-full flex items-center justify-center text-2xl font-bold mb-2">相手</div>
           <span>接続待ち...</span>
@@ -58,21 +81,25 @@
         <div class="absolute bottom-4 left-4 bg-black/50 px-3 py-1 rounded text-xs">参加者</div>
       </div>
 
-      <!-- 自分のビデオ -->
+      <!-- 自分 -->
       <div class="relative bg-[#3c4043] rounded-2xl overflow-hidden flex items-center justify-center shadow-lg">
         <video id="local-video" autoplay muted playsinline class="w-full h-full"></video>
+        <div id="local-audio-indicator" class="hidden flex-col items-center justify-center space-y-3">
+          <div class="w-24 h-24 bg-gray-600 rounded-full flex items-center justify-center text-3xl font-bold">あなた</div>
+          <span class="text-gray-300">音声通話モード</span>
+        </div>
         <div class="absolute bottom-4 left-4 bg-black/50 px-3 py-1 rounded text-xs">あなた</div>
       </div>
     </div>
   </main>
 
-  <!-- Google Meet風 下部コントロールバー -->
+  <!-- コントロールバー -->
   <footer class="h-20 bg-[#202124] flex items-center justify-center px-6 border-t border-[#3c4043] space-x-4">
     <!-- マイクボタン -->
     <button id="mic-btn" onclick="toggleMic()" class="w-12 h-12 rounded-full bg-[#3c4043] hover:bg-[#4f5358] flex items-center justify-center transition text-white">
       <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 11a7 7 0 01-7 7m0 0a7 7 0 01-7-7m7 7v4m0 0H8m4 0h4m-4-8a3 3 0 01-3-3V5a3 3 0 116 0v6a3 3 0 01-3 3z"></path></svg>
     </button>
-    <!-- カメラボタン -->
+    <!-- カメラボタン（音声モード時は無効化または非表示にすることも可能） -->
     <button id="cam-btn" onclick="toggleCam()" class="w-12 h-12 rounded-full bg-[#3c4043] hover:bg-[#4f5358] flex items-center justify-center transition text-white">
       <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg>
     </button>
@@ -82,7 +109,7 @@
     </button>
     <!-- 通話終了ボタン -->
     <button onclick="endCall()" class="w-14 h-12 rounded-full bg-red-600 hover:bg-red-700 flex items-center justify-center transition text-white" title="通話を終了">
-      <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M16 8l2-2m0 0l2-2m-2 2l-2-2m2 2l2 2M5 3a2 2 0 00-2 2v1c0 8.284 6.716 15 15 15h1a2 2 0 002-2v-3.28a1 1 0 00-.684-.948l-4.493-1.498a1 1 0 00-1.21.502l-1.13 2.257a11.042 11.042 0 01-5.516-5.517l2.257-1.128a1 1 0 00.502-1.21L9.228 3.683A1 1 0 008.28 3H5z"></path></svg>
+      <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M16 8l2-2m0 0l2-2m-2 2l-2-2m2 2l2 2M5 3a2 2 0 00-2 2v1c0 8.284 6.716 15 15 15h1a2 2 0 002-2v-3.28a1 1 0 00-.684-.948l-4.493-1.498a1 1 0 00-1.21.502l-1.13 2.257a11.042 11.042 0 01-5.516-5.517l2.257-1.128a1-1 0 00.502-1.21L9.228 3.683A1 1 0 008.28 3H5z"></path></svg>
     </button>
   </footer>
 
@@ -93,41 +120,83 @@
     let isMicMuted = false;
     let isCamOff = false;
     let isScreenSharing = false;
+    let currentMode = 'video'; // 'video' or 'audio'
 
-    // URLパラメータから自動接続をチェック (例: ?id=xxxx)
     window.addEventListener('DOMContentLoaded', () => {
       const urlParams = new URLSearchParams(window.location.search);
       const targetId = urlParams.get('id');
       if (targetId) {
         document.getElementById('partner-id').value = targetId;
       }
-      initPeer();
+      initMediaAndPeer();
     });
 
-    async function initPeer() {
+    async function initMediaAndPeer() {
+      if (localStream) {
+        localStream.getTracks().forEach(track => track.stop());
+      }
+
+      const constraints = currentMode === 'video' 
+        ? { video: true, audio: true } 
+        : { video: false, audio: true };
+
       try {
-        localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
-        document.getElementById('local-video').srcObject = localStream;
+        localStream = await navigator.mediaDevices.getUserMedia(constraints);
+        
+        const localVideo = document.getElementById('local-video');
+        const localAudioInd = document.getElementById('local-audio-indicator');
+        const camBtn = document.getElementById('cam-btn');
+
+        if (currentMode === 'video') {
+          localVideo.srcObject = localStream;
+          localVideo.classList.remove('hidden');
+          localAudioInd.classList.add('hidden');
+          localAudioInd.classList.remove('flex');
+          camBtn.disabled = false;
+          camBtn.classList.opacity = '1';
+        } else {
+          localVideo.srcObject = null;
+          localVideo.classList.add('hidden');
+          localAudioInd.classList.remove('hidden');
+          localAudioInd.classList.add('flex');
+          camBtn.disabled = true;
+          camBtn.style.opacity = '0.5';
+        }
+
         document.getElementById('status-text').innerText = '接続準備完了';
       } catch (err) {
         console.error(err);
-        document.getElementById('status-text').innerText = 'カメラ/マイクの権限エラー';
-        alert('カメラまたはマイクの取得に失敗しました。ブラウザの権限を確認してください。');
+        // カメラがない場合などのフォールバック：自動的に音声通話モードに切り替える
+        if (currentMode === 'video' && err.name === 'NotFoundError') {
+          alert('カメラが見つからないため、自動的に「音声通話のみ」モードに切り替えます。');
+          document.querySelector('input[value="audio"]').checked = true;
+          currentMode = 'audio';
+          initMediaAndPeer();
+          return;
+        }
+        document.getElementById('status-text').innerText = 'マイク/カメラの権限エラー';
+        alert('マイクまたはカメラの取得に失敗しました。ブラウザの権限設定を確認してください。');
       }
 
-      peer = new Peer();
-
-      peer.on('open', (id) => {
-        document.getElementById('my-id').innerText = id;
-      });
-
-      peer.on('call', (call) => {
-        currentCall = call;
-        call.answer(localStream);
-        call.on('stream', (remoteStream) => {
-          handleRemoteStream(remoteStream);
+      if (!peer) {
+        peer = new Peer();
+        peer.on('open', (id) => {
+          document.getElementById('my-id').innerText = id;
         });
-      });
+
+        peer.on('call', (call) => {
+          currentCall = call;
+          call.answer(localStream);
+          call.on('stream', (remoteStream) => {
+            handleRemoteStream(remoteStream);
+          });
+        });
+      }
+    }
+
+    function switchMode(mode) {
+      currentMode = mode;
+      initMediaAndPeer();
     }
 
     function connectToPartner() {
@@ -146,9 +215,26 @@
     }
 
     function handleRemoteStream(stream) {
-      document.getElementById('remote-video').srcObject = stream;
+      const remoteVideo = document.getElementById('remote-video');
+      const remoteAudioInd = document.getElementById('remote-audio-indicator');
+      
+      // リモートストリームにビデオトラックが含まれているか確認
+      const hasVideo = stream.getVideoTracks().length > 0;
+
+      if (hasVideo) {
+        remoteVideo.srcObject = stream;
+        remoteVideo.classList.remove('hidden');
+        remoteAudioInd.classList.add('hidden');
+        remoteAudioInd.classList.remove('flex');
+      } else {
+        remoteVideo.srcObject = null;
+        remoteVideo.classList.add('hidden');
+        remoteAudioInd.classList.remove('hidden');
+        remoteAudioInd.classList.add('flex');
+      }
+
       document.getElementById('remote-placeholder').style.display = 'none';
-      document.getElementById('connect-screen').style.display = 'none'; // 接続成功時にモーダルを隠す
+      document.getElementById('connect-screen').style.display = 'none';
     }
 
     function copyRoomLink() {
@@ -156,11 +242,27 @@
       if (myId === '生成中...') return alert('IDの生成をお待ちください');
       const shareUrl = `${window.location.origin}${window.location.pathname}?id=${myId}`;
       navigator.clipboard.writeText(shareUrl).then(() => {
-        alert('通話リンクをコピーしました！相手に共有してください。');
+        alert('通話リンクをコピーしました！');
       });
     }
 
-    // コントロール機能
+    // 背景色変更
+    function changeBgColor(color) {
+      document.documentElement.style.setProperty('--bg-color', color);
+      // パネルの色も背景色に合わせて少し濃淡をつけるか連動させる
+      document.documentElement.style.setProperty('--panel-color', adjustColor(color, 15));
+    }
+
+    // カラーコードの明度を微調整するヘルパー
+    function adjustColor(hex, amount) {
+      return '#' + hex.replace(/^#/, '').replace(/../.exec(hex) ? /../g : /./g, color => {
+        let num = parseInt(color, 16) + amount;
+        if (num > 255) num = 255;
+        if (num < 0) num = 0;
+        return (num.toString(16)).padStart(2, '0');
+      });
+    }
+
     function toggleMic() {
       if (!localStream) return;
       const audioTrack = localStream.getAudioTracks()[0];
@@ -174,7 +276,7 @@
     }
 
     function toggleCam() {
-      if (!localStream) return;
+      if (currentMode === 'audio' || !localStream) return;
       const videoTrack = localStream.getVideoTracks()[0];
       if (videoTrack) {
         isCamOff = !isCamOff;
@@ -186,24 +288,20 @@
     }
 
     async function toggleScreenShare() {
+      if (currentMode === 'audio') return alert('音声通話モードでは画面共有は利用できません');
       try {
         if (!isScreenSharing) {
           const screenStream = await navigator.mediaDevices.getDisplayMedia({ video: true });
           const screenTrack = screenStream.getVideoTracks()[0];
 
-          // 自分のビデオを画面共有に切り替え
           document.getElementById('local-video').srcObject = screenStream;
 
-          // 通話中ならピアに新しいトラックを送信
           if (currentCall) {
             const sender = currentCall.peerConnection.getSenders().find(s => s.track && s.track.kind === 'video');
             if (sender) sender.replaceTrack(screenTrack);
           }
 
-          screenTrack.onended = () => {
-            stopScreenShare();
-          };
-
+          screenTrack.onended = () => { stopScreenShare(); };
           isScreenSharing = true;
           document.getElementById('screen-btn').classList.add('bg-blue-600');
         } else {
@@ -219,7 +317,6 @@
       isScreenSharing = false;
       document.getElementById('screen-btn').classList.remove('bg-blue-600');
       
-      // カメラ映像に戻す
       const videoTrack = localStream.getVideoTracks()[0];
       document.getElementById('local-video').srcObject = localStream;
       if (currentCall) {
@@ -229,9 +326,7 @@
     }
 
     function endCall() {
-      if (currentCall) {
-        currentCall.close();
-      }
+      if (currentCall) currentCall.close();
       location.reload();
     }
   </script>
