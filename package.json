@@ -1,0 +1,18 @@
+{
+  "name": "suzuzora-meet",
+  "version": "1.0.0",
+  "private": true,
+  "description": "suzuzora meet - browser based WebRTC meeting app",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "vercel-build": "node -e \"console.log('No build step required')\""
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "express": "^4.21.2",
+    "socket.io": "^4.8.1"
+  }
+}
