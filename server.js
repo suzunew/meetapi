@@ -4,9 +4,19 @@ const express = require('express');
 const { Server } = require('socket.io');
 const app = express();
 const server = http.createServer(app);
-const io = new Server(server, { maxHttpBufferSize: 300000, cors: { origin: true, methods: ['GET', 'POST'] } });
+const io = new Server(server, { maxHttpBufferSize: 300000, cors: { origin: '*', methods: ['GET', 'POST'], allowedHeaders: ['Content-Type', 'Authorization'] }, transports: ['websocket', 'polling'] });
 const port = Number(process.env.PORT) || 3000;
 const maxRoomSize = 8;
+app.disable('x-powered-by');
+app.use((req, res, next) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  res.setHeader('Access-Control-Max-Age', '86400');
+  res.setHeader('Permissions-Policy', 'microphone=(self), camera=(self), display-capture=(self)');
+  if (req.method === 'OPTIONS') return res.status(204).end();
+  next();
+});
 const iceServers = [{ urls: 'stun:stun.l.google.com:19302' }, { urls: 'stun:stun1.l.google.com:19302' }];
 const html = String.raw`<!doctype html>
 <html lang="ja">
@@ -54,7 +64,7 @@ const html = String.raw`<!doctype html>
 'use strict';
 const SERVER_URL = location.origin;
 const $ = (id) => document.getElementById(id);
-const state = {socket:null, joined:false, joining:false, roomId:'', name:'', localStream:null, cameraTrack:null, micOn:false, cameraOn:false, handRaised:false, screenStream:null, sharing:false, peers:new Map(), participants:new Map(), joinAt:0, timerId:null, disconnected:false, config:null, audioOnlyNext:false};
+const state = {socket:null, joined:false, joining:false, recovering:false, roomId:'', name:'', localStream:null, cameraTrack:null, micOn:false, cameraOn:false, handRaised:false, screenStream:null, sharing:false, peers:new Map(), participants:new Map(), joinAt:0, timerId:null, disconnected:false, config:null, audioOnlyNext:false, gasUrl:new URLSearchParams(location.search).get('gas')||''};
 const SVG = {
  mic:\`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="9" y="3" width="6" height="12" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3M9 21h6"/></svg>\`,
  micOff:\`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="m3 3 18 18M9 9v2a3 3 0 0 0 5.2 2M15 9V5a3 3 0 0 0-5.8-1M5 11a7 7 0 0 0 11.9 5M19 11a7 7 0 0 1-1 3.5M12 18v3M9 21h6"/></svg>\`,
@@ -73,13 +83,14 @@ $('new-meeting').addEventListener('click',()=>showJoin(makeId()));$('join-meetin
 $('join-form').addEventListener('submit',async e=>{e.preventDefault();const name=$('display-name').value.trim();const room=$('room-code').value.trim().replace(/\s+/g,'').toUpperCase();if(!name){showJoinError('表示名を入力してください。');return;}if(!room){showJoinError('会議コードを入力してください。');return;}if(!/^[A-Z0-9_-]{4,32}$/.test(room)){showJoinError('会議コードは半角英数字・ハイフン・アンダースコアの4〜32文字で入力してください。');return;}state.audioOnlyNext=$('audio-only').checked;await joinRoom(name,room);});
 function showJoinError(m){$('join-error').textContent=m;$('join-error').classList.remove('hidden');}
 async function loadServerConfig(){if(!SERVER_URL)throw new Error('会議サーバーに接続できません。');try{const r=await fetch(SERVER_URL+'/api/config',{cache:'no-store'});if(!r.ok)throw new Error('config');state.config=await r.json();}catch(e){state.config={iceServers:[{urls:'stun:stun.l.google.com:19302'},{urls:'stun:stun1.l.google.com:19302'}]};}}
-function createSocket(){if(state.socket)return state.socket;if(typeof io!=='function')throw new Error('会議サーバーに接続できません。');const s=io(SERVER_URL,{transports:['websocket','polling'],reconnection:true,timeout:12000});state.socket=s;s.on('connect',()=>{if(state.joined){$('connection-status').textContent='接続済み';$('connection-banner').classList.add('hidden');}});s.on('disconnect',()=>{if(state.joined){$('connection-status').textContent='再接続中';$('connection-banner').textContent='接続が切れました。再接続しています…';$('connection-banner').classList.remove('hidden');}});s.on('connect_error',err=>{console.warn('Socket connection failed',err?.message);});s.on('peer-joined',p=>{if(!state.joined||!p?.id)return;state.participants.set(p.id,p);renderParticipants();toast((p.name||'参加者')+' が参加しました',1800);});s.on('peer-left',p=>{if(!state.joined||!p?.id)return;closePeer(p.id);state.participants.delete(p.id);renderParticipants();toast((p.name||'参加者')+' が退出しました',1800);});s.on('participant-state',p=>{if(!state.joined||!p?.id)return;const old=state.participants.get(p.id)||{};state.participants.set(p.id,{...old,...p});renderParticipants();});s.on('signal',data=>handleSignal(data).catch(err=>console.warn('WebRTC signal error',err)));s.on('room-error',d=>toast(d?.message||'会議でエラーが発生しました。'));return s;}
+async function recoverRoomAfterReconnect(socket){if(state.recovering||!state.joined||!state.roomId)return;state.recovering=true;$('connection-status').textContent='会議を再接続中';$('connection-banner').textContent='接続が復旧しました。会議を再接続しています…';$('connection-banner').classList.remove('hidden');try{for(const id of Array.from(state.peers.keys()))closePeer(id);state.participants.clear();const result=await new Promise((resolve,reject)=>{const to=setTimeout(()=>reject(new Error('会議の再接続がタイムアウトしました。')),10000);socket.emit('join-room',{roomId:state.roomId,name:state.name,gasUrl:state.gasUrl,clientState:{micOn:state.micOn,videoOn:state.cameraOn,handRaised:state.handRaised,sharing:state.sharing}},res=>{clearTimeout(to);if(!res?.ok)reject(new Error(res?.message||'会議に再接続できませんでした。'));else resolve(res);});});if(!state.joined||socket!==state.socket)return;if(result.self)state.participants.set(result.self.id,{...result.self,...getLocalDescription()});for(const p of result.peers||[])state.participants.set(p.id,p);renderParticipants();for(const p of result.peers||[])await createOfferFor(p.id);$('connection-status').textContent='接続済み';$('connection-banner').classList.add('hidden');}catch(err){console.warn('Room reconnection failed',err);$('connection-status').textContent='再接続待ち';$('connection-banner').textContent='会議に再接続できません。接続が回復したら自動で再試行します。';$('connection-banner').classList.remove('hidden');}finally{state.recovering=false;}}
+function createSocket(){if(state.socket)return state.socket;if(typeof io!=='function')throw new Error('会議サーバーに接続できません。');const s=io(SERVER_URL,{transports:['websocket','polling'],reconnection:true,reconnectionAttempts:Infinity,reconnectionDelay:800,reconnectionDelayMax:5000,timeout:12000});state.socket=s;s.on('connect',()=>{if(state.joined){$('connection-status').textContent='接続済み';$('connection-banner').classList.add('hidden');recoverRoomAfterReconnect(s).catch(err=>console.warn(err));}});s.on('disconnect',()=>{if(state.joined){$('connection-status').textContent='再接続中';$('connection-banner').textContent='接続が切れました。再接続しています…';$('connection-banner').classList.remove('hidden');}});s.on('connect_error',err=>{console.warn('Socket connection failed',err?.message);});s.on('peer-joined',p=>{if(!state.joined||!p?.id)return;state.participants.set(p.id,p);renderParticipants();toast((p.name||'参加者')+' が参加しました',1800);});s.on('peer-left',p=>{if(!state.joined||!p?.id)return;closePeer(p.id);state.participants.delete(p.id);renderParticipants();toast((p.name||'参加者')+' が退出しました',1800);});s.on('participant-state',p=>{if(!state.joined||!p?.id)return;const old=state.participants.get(p.id)||{};state.participants.set(p.id,{...old,...p});renderParticipants();});s.on('signal',data=>handleSignal(data).catch(err=>console.warn('WebRTC signal error',err)));s.on('room-error',d=>toast(d?.message||'会議でエラーが発生しました。'));return s;}
 function getLocalDescription(){return {id:state.socket?.id,name:state.name,micOn:state.micOn,videoOn:state.cameraOn,handRaised:state.handRaised,sharing:state.sharing};}
 async function joinRoom(name,roomId){if(state.joining||state.joined)return;state.joining=true;$('join-submit').disabled=true;$('join-submit').textContent='接続中…';$('join-error').classList.add('hidden');try{await loadServerConfig();const socket=createSocket();if(!socket.connected)await new Promise((resolve,reject)=>{const to=setTimeout(()=>reject(new Error('Renderサーバーに接続できません。URLを確認してください。')),14000);socket.once('connect',()=>{clearTimeout(to);resolve();});socket.once('connect_error',()=>{clearTimeout(to);reject(new Error('Renderサーバーに接続できません。少し待ってから再度お試しください。'));});});state.name=name.slice(0,40);state.roomId=roomId;state.micOn=false;state.cameraOn=false;state.handRaised=false;state.sharing=false;
     try{state.localStream=await navigator.mediaDevices.getUserMedia({audio:true,video:!state.audioOnlyNext});state.micOn=state.localStream.getAudioTracks().length>0;state.cameraTrack=state.localStream.getVideoTracks()[0]||null;state.cameraOn=!!state.cameraTrack;}catch(mediaErr){console.warn('Combined media permission failed',mediaErr);try{state.localStream=await navigator.mediaDevices.getUserMedia({audio:true,video:false});state.micOn=true;}catch(_){state.localStream=new MediaStream();}if(!state.audioOnlyNext){try{const vs=await navigator.mediaDevices.getUserMedia({audio:false,video:true});state.cameraTrack=vs.getVideoTracks()[0]||null;if(state.cameraTrack){state.localStream.addTrack(state.cameraTrack);state.cameraOn=true;}}catch(_){state.cameraTrack=null;}}toast('カメラまたはマイクを利用できません。通話画面のボタンから再度お試しください。',4500);}if(state.audioOnlyNext){state.cameraOn=false;if(state.cameraTrack)state.cameraTrack.enabled=false;}
     state.localStream.getAudioTracks().forEach(t=>t.enabled=state.micOn);state.localStream.getVideoTracks().forEach(t=>t.enabled=state.cameraOn);
-    const result=await new Promise((resolve,reject)=>{const to=setTimeout(()=>reject(new Error('会議に参加できませんでした。')),10000);socket.emit('join-room',{roomId,name:state.name,clientState:{micOn:state.micOn,videoOn:state.cameraOn,handRaised:false}},res=>{clearTimeout(to);if(!res?.ok)reject(new Error(res?.message||'会議に参加できませんでした。'));else resolve(res);});});
-    state.joined=true;state.joining=false;state.audioOnlyNext=false;state.joinAt=Date.now();state.participants.clear();state.peers.clear();if(result.self)state.participants.set(result.self.id,{...result.self,...getLocalDescription()});for(const p of (result.peers||[]))state.participants.set(p.id,p);hideJoin();$('landing-view').classList.add('hidden');$('meeting-view').classList.remove('hidden');$('meet-title').textContent='suzuzora の会議';$('meet-code').textContent=roomId;$('connection-status').textContent='接続済み';$('connection-banner').classList.add('hidden');$('mic-toggle').classList.toggle('off',!state.micOn);$('mic-toggle').classList.toggle('active',state.micOn);$('mic-toggle').innerHTML=state.micOn?SVG.mic:SVG.micOff;$('camera-toggle').classList.toggle('off',!state.cameraOn);$('camera-toggle').classList.toggle('active',state.cameraOn);$('camera-toggle').innerHTML=state.cameraOn?SVG.cam:SVG.camOff;history.replaceState({},'',\`\${location.pathname}?room=\${encodeURIComponent(roomId)}\`);renderParticipants();startTimer();for(const p of result.peers||[])await createOfferFor(p.id);if(!state.cameraOn)toast('カメラはオフです。必要に応じて下のボタンからオンにできます。');}catch(err){console.error(err);state.joined=false;state.joining=false;state.audioOnlyNext=false;showJoinError(err?.message||'会議に参加できませんでした。');stopLocalMedia();}finally{$('join-submit').disabled=false;$('join-submit').textContent='会議に参加';}}
+    const result=await new Promise((resolve,reject)=>{const to=setTimeout(()=>reject(new Error('会議に参加できませんでした。')),10000);socket.emit('join-room',{roomId,name:state.name,gasUrl:state.gasUrl,clientState:{micOn:state.micOn,videoOn:state.cameraOn,handRaised:false}},res=>{clearTimeout(to);if(!res?.ok)reject(new Error(res?.message||'会議に参加できませんでした。'));else resolve(res);});});
+    state.joined=true;state.joining=false;state.audioOnlyNext=false;state.joinAt=Date.now();state.participants.clear();state.peers.clear();if(result.self)state.participants.set(result.self.id,{...result.self,...getLocalDescription()});for(const p of (result.peers||[]))state.participants.set(p.id,p);hideJoin();$('landing-view').classList.add('hidden');$('meeting-view').classList.remove('hidden');$('meet-title').textContent='suzuzora の会議';$('meet-code').textContent=roomId;$('connection-status').textContent='接続済み';$('connection-banner').classList.add('hidden');$('mic-toggle').classList.toggle('off',!state.micOn);$('mic-toggle').classList.toggle('active',state.micOn);$('mic-toggle').innerHTML=state.micOn?SVG.mic:SVG.micOff;$('camera-toggle').classList.toggle('off',!state.cameraOn);$('camera-toggle').classList.toggle('active',state.cameraOn);$('camera-toggle').innerHTML=state.cameraOn?SVG.cam:SVG.camOff;const activeParams=new URLSearchParams(location.search);activeParams.set('room',roomId);if(state.gasUrl)activeParams.set('gas',state.gasUrl);history.replaceState({},'',\`\${location.pathname}?\${activeParams.toString()}\`);renderParticipants();startTimer();for(const p of result.peers||[])await createOfferFor(p.id);if(!state.cameraOn)toast('カメラはオフです。必要に応じて下のボタンからオンにできます。');}catch(err){console.error(err);state.joined=false;state.joining=false;state.audioOnlyNext=false;showJoinError(err?.message||'会議に参加できませんでした。');stopLocalMedia();}finally{$('join-submit').disabled=false;$('join-submit').textContent='会議に参加';}}
 function startTimer(){clearInterval(state.timerId);const update=()=>{if(!state.joinAt)return;const sec=Math.floor((Date.now()-state.joinAt)/1000);const hh=String(Math.floor(sec/3600)).padStart(2,'0'),mm=String(Math.floor(sec/60)%60).padStart(2,'0'),ss=String(sec%60).padStart(2,'0');$('meet-title').textContent=\`会議中 · \${hh==='00'?'':hh+':'}\${mm}:\${ss}\`;};update();state.timerId=setInterval(update,1000);}
 function pcConfig(){return {iceServers:state.config?.iceServers||[{urls:'stun:stun.l.google.com:19302'}], bundlePolicy:'max-bundle'};}
 function getPeer(id,meta={}){let item=state.peers.get(id);if(item)return item;const pc=new RTCPeerConnection(pcConfig());item={pc,remoteStream:new MediaStream(),pendingCandidates:[],meta};state.peers.set(id,item);const stream=state.localStream||new MediaStream();try{pc.addTransceiver('audio',{direction:'sendrecv',streams:[stream]});pc.addTransceiver('video',{direction:'sendrecv',streams:[stream]});}catch(err){console.warn('transceiver init',err);}const audioSender=pc.getTransceivers().find(t=>t.receiver?.track?.kind==='audio')?.sender;const videoSender=pc.getTransceivers().find(t=>t.receiver?.track?.kind==='video')?.sender;const at=stream.getAudioTracks()[0];const vt=state.sharing?state.screenStream?.getVideoTracks()[0]:state.cameraTrack;if(audioSender&&at)audioSender.replaceTrack(at).catch(()=>{});if(videoSender&&vt)videoSender.replaceTrack(vt).catch(()=>{});
@@ -99,23 +110,60 @@ $('share-toggle').addEventListener('click',async()=>{if(!state.joined)return;if(
 async function stopScreenShare(){if(!state.sharing)return;state.sharing=false;const old=state.screenStream;state.screenStream=null;const cam=state.cameraOn?state.cameraTrack:null;for(const item of state.peers.values()){const sender=item.pc.getTransceivers().find(t=>t.receiver?.track?.kind==='video')?.sender;if(sender)try{await sender.replaceTrack(cam||null);}catch(e){console.warn(e);}}old?.getTracks().forEach(t=>t.stop());$('share-toggle').classList.remove('active');$('share-toggle').title='画面共有';emitMyState();}
 function openPeoplePanel(){$('side-panel').classList.remove('hidden');renderPeoplePanel();}
 $('people-open').addEventListener('click',()=>{if(!$('side-panel').classList.contains('hidden'))$('side-panel').classList.add('hidden');else openPeoplePanel();});$('close-panel').addEventListener('click',()=>$('side-panel').classList.add('hidden'));
-$('invite-open').addEventListener('click',async()=>{const url=location.origin+location.pathname+'?room='+encodeURIComponent(state.roomId);try{await navigator.clipboard.writeText(url);toast('招待リンクをコピーしました');}catch(_){const ta=document.createElement('textarea');ta.value=url;document.body.appendChild(ta);ta.select();try{document.execCommand('copy');toast('招待リンクをコピーしました');}catch(e){toast('招待リンク：'+url,8000);}ta.remove();}});
-async function leaveRoom(){if(!state.joined&&!state.joining)return;if(state.sharing)await stopScreenShare();state.joined=false;state.joining=false;clearInterval(state.timerId);state.timerId=null;try{state.socket?.emit('leave-room');}catch(_){}for(const id of Array.from(state.peers.keys()))closePeer(id);stopLocalMedia();state.participants.clear();state.roomId='';state.joinAt=0;state.handRaised=false;$('meeting-view').classList.add('hidden');$('landing-view').classList.remove('hidden');$('side-panel').classList.add('hidden');$('connection-banner').classList.add('hidden');$('room-code').value='';history.replaceState({},'',location.pathname);if(state.socket){state.socket.disconnect();state.socket=null;}}
+$('invite-open').addEventListener('click',async()=>{const invite=new URL(location.origin+location.pathname);invite.searchParams.set('room',state.roomId);if(state.gasUrl)invite.searchParams.set('gas',state.gasUrl);const url=invite.toString();try{await navigator.clipboard.writeText(url);toast('招待リンクをコピーしました');}catch(_){const ta=document.createElement('textarea');ta.value=url;document.body.appendChild(ta);ta.select();try{document.execCommand('copy');toast('招待リンクをコピーしました');}catch(e){toast('招待リンク：'+url,8000);}ta.remove();}});
+async function leaveRoom(){if(!state.joined&&!state.joining)return;if(state.sharing)await stopScreenShare();state.joined=false;state.joining=false;clearInterval(state.timerId);state.timerId=null;try{state.socket?.emit('leave-room');}catch(_){}for(const id of Array.from(state.peers.keys()))closePeer(id);stopLocalMedia();state.participants.clear();state.roomId='';state.joinAt=0;state.handRaised=false;$('meeting-view').classList.add('hidden');$('landing-view').classList.remove('hidden');$('side-panel').classList.add('hidden');$('connection-banner').classList.add('hidden');$('room-code').value='';const cleanParams=new URLSearchParams();if(state.gasUrl)cleanParams.set('gas',state.gasUrl);history.replaceState({},'',location.pathname+(cleanParams.size?'?'+cleanParams.toString():''));if(state.socket){state.socket.disconnect();state.socket=null;}}
 function stopLocalMedia(){if(state.localStream)state.localStream.getTracks().forEach(t=>t.stop());if(state.screenStream)state.screenStream.getTracks().forEach(t=>t.stop());state.localStream=null;state.cameraTrack=null;state.screenStream=null;state.sharing=false;state.micOn=false;state.cameraOn=false;}
-$('leave-meeting').addEventListener('click',async()=>{const ok=confirm('この会議から退出しますか？');if(ok){await leaveRoom();}});window.addEventListener('beforeunload',()=>{try{state.socket?.emit('leave-room');}catch(_){}stopLocalMedia();});
+$('leave-meeting').addEventListener('click',async()=>{const ok=confirm('この会議から退出しますか？');if(ok){await leaveRoom();}});window.addEventListener('pagehide',event=>{if(event.persisted){try{state.socket?.emit('leave-room');}catch(_){}if(state.socket?.connected)state.socket.disconnect();return;}try{state.socket?.emit('leave-room');}catch(_){}stopLocalMedia();});
+window.addEventListener('pageshow',event=>{if(event.persisted&&state.joined&&state.socket){$('connection-status').textContent='再接続中';$('connection-banner').textContent='ページ復帰後、会議に再接続しています…';$('connection-banner').classList.remove('hidden');state.socket.connect();}});
 const invitedRoom=roomFromUrl();if(invitedRoom){$('room-code').value=invitedRoom;setTimeout(()=>showJoin(invitedRoom),180);}
 })();
 </script>
 </body>
 </html>
 `.replaceAll('\\`', '`').replaceAll('\\${', '${');
+const GAS_API_TOKEN = '8032ef9e297ad364194aa106638f4dbcf562677319ed42e6a598b1d8cfe70d53';
 const rooms = new Map();
+function cleanGasUrl(value) {
+  try {
+    const url = new URL(String(value || ''));
+    if (url.protocol !== 'https:' || url.hostname !== 'script.google.com' || !/^\/macros\/s\/[^/]+\/exec$/.test(url.pathname)) return '';
+    return url.toString();
+  } catch (_) {
+    return '';
+  }
+}
+async function recordGasEvent(gasUrl, eventType, roomId, participantCount) {
+  const apiUrl = cleanGasUrl(gasUrl);
+  const allowedEvents = new Set(['meeting_started', 'participant_joined', 'participant_left', 'meeting_ended']);
+  const room = cleanRoom(roomId);
+  if (!apiUrl || !allowedEvents.has(eventType) || !room) return;
+  try {
+    const response = await fetch(apiUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+      body: JSON.stringify({ apiToken: GAS_API_TOKEN, action: 'recordMeetingEvent', eventType, roomId: room, participantCount: Math.max(0, Math.min(maxRoomSize, Number(participantCount) || 0)) }),
+      redirect: 'follow',
+      signal: AbortSignal.timeout(12000)
+    });
+    const payload = await response.text();
+    if (!response.ok) throw new Error('GAS API HTTP ' + response.status);
+    try {
+      const result = JSON.parse(payload);
+      if (!result.ok) throw new Error(result.error || 'GAS API error');
+    } catch (error) {
+      if (error instanceof SyntaxError) throw new Error('GAS APIからJSON以外の応答が返りました');
+      throw error;
+    }
+  } catch (error) {
+    process.stderr.write('GAS meeting log failed: ' + String(error && error.message || error) + '\n');
+  }
+}
 function cleanText(value, max = 1000) { return String(value == null ? '' : value).replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, '').trim().slice(0, max); }
 function cleanRoom(value) { const room = String(value || '').trim().toUpperCase(); return /^[A-Z0-9_-]{4,32}$/.test(room) ? room : ''; }
 function cleanState(value) { value = value && typeof value === 'object' ? value : {}; return { micOn: value.micOn !== false, videoOn: value.videoOn === true, handRaised: value.handRaised === true, sharing: value.sharing === true }; }
 function ensureRoom(roomId) { let room = rooms.get(roomId); if (!room) { room = { peers: new Map() }; rooms.set(roomId, room); } return room; }
 function participantFor(socket, name, clientState) { return { id: socket.id, name: cleanText(name, 40) || '参加者', ...cleanState(clientState) }; }
-function leaveRoom(socket) { const roomId = socket.data.roomId; if (!roomId) return; const room = rooms.get(roomId); const participant = room && room.peers.get(socket.id); if (room && participant) { room.peers.delete(socket.id); socket.to(roomId).emit('peer-left', { id: socket.id, name: participant.name }); if (room.peers.size === 0) rooms.delete(roomId); } socket.leave(roomId); delete socket.data.roomId; delete socket.data.name; }
+function leaveRoom(socket) { const roomId = socket.data.roomId; if (!roomId) return; const gasUrl = socket.data.gasUrl || ''; const room = rooms.get(roomId); const participant = room && room.peers.get(socket.id); if (room && participant) { const wasLast = room.peers.size === 1; room.peers.delete(socket.id); socket.to(roomId).emit('peer-left', { id: socket.id, name: participant.name }); const remaining = room.peers.size; void recordGasEvent(gasUrl, 'participant_left', roomId, remaining); if (wasLast) { void recordGasEvent(gasUrl, 'meeting_ended', roomId, 0); rooms.delete(roomId); } } socket.leave(roomId); delete socket.data.roomId; delete socket.data.name; delete socket.data.gasUrl; }
 app.get('/api/health', (_req, res) => res.json({ ok: true, service: 'suzuzora-meet', rooms: rooms.size, uptimeSeconds: Math.floor(process.uptime()) }));
 app.get('/api/config', (_req, res) => res.json({ iceServers }));
 app.get('/', (_req, res) => res.type('html').send(html));
@@ -129,12 +177,17 @@ io.on('connection', socket => {
     if (socket.data.roomId) leaveRoom(socket);
     const room = ensureRoom(roomId);
     if (room.peers.size >= maxRoomSize) return reply({ ok: false, message: `この会議は満員です（上限 ${maxRoomSize} 人）。` });
+    const isFirstParticipant = room.peers.size === 0;
     const peers = Array.from(room.peers.values()).map(p => ({ ...p }));
     const participant = participantFor(socket, name, payload && payload.clientState);
+    const gasUrl = cleanGasUrl(payload && payload.gasUrl);
     room.peers.set(socket.id, participant);
     socket.join(roomId);
     socket.data.roomId = roomId;
     socket.data.name = name;
+    socket.data.gasUrl = gasUrl;
+    if (isFirstParticipant) void recordGasEvent(gasUrl, 'meeting_started', roomId, 1);
+    void recordGasEvent(gasUrl, 'participant_joined', roomId, room.peers.size);
     reply({ ok: true, self: { ...participant }, peers });
     socket.to(roomId).emit('peer-joined', { ...participant });
   });
