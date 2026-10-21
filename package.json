@@ -1,8 +1,8 @@
 {
   "name": "suzuzora-meet",
-  "version": "2.0.0",
+  "version": "3.0.0",
   "private": true,
-  "description": "suzuzora meet and RINE-style chat service with WebRTC calls",
+  "description": "suzuzora meet WebRTC video and audio meetings",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
